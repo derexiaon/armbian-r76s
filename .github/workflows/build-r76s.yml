@@ -1,0 +1,461 @@
+name: Build Armbian NanoPi R76S (vendor 6.1)
+
+# Сборка запускается только вручную: Actions → «Build Armbian NanoPi R76S» → Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Debian userspace"
+        type: choice
+        options:
+          - trixie
+          - bookworm
+        default: trixie
+      armbian_ref:
+        description: "armbian/build: ветка, тег или SHA"
+        type: string
+        default: main
+      expected_kernel:
+        description: "Ожидаемая версия ядра (при расхождении будет предупреждение)"
+        type: string
+        default: "6.1.172"
+      prerelease:
+        description: "Опубликовать как pre-release"
+        type: boolean
+        default: false
+      runner:
+        description: "Раннер (arm64 — нативная сборка, x86_64 — запасной вариант)"
+        type: choice
+        options:
+          - ubuntu-24.04-arm
+          - ubuntu-24.04
+        default: ubuntu-24.04-arm
+      timezone:
+        description: "Пресет первого входа: часовой пояс (пусто — спросить при входе)"
+        type: string
+        default: Europe/Moscow
+      locale:
+        description: "Пресет первого входа: локаль (пусто — спросить при входе)"
+        type: string
+        default: en_US.UTF-8
+      ssh_pubkey:
+        description: "Необязательно: публичный SSH-ключ для root (одна строка ssh-ed25519/ssh-rsa/ecdsa-...)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-r76s-${{ inputs.release }}
+  cancel-in-progress: false
+
+env:
+  BOARD: nanopi-r76s
+  BRANCH: vendor
+  ARMBIAN_REPO: https://github.com/armbian/build.git
+
+jobs:
+  build:
+    name: Build image (${{ inputs.release }}, ${{ inputs.runner }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.kernel.outputs.image }}
+    env:
+      IN_RELEASE: ${{ inputs.release }}
+      IN_ARMBIAN_REF: ${{ inputs.armbian_ref }}
+      IN_EXPECTED_KERNEL: ${{ inputs.expected_kernel }}
+      IN_PRERELEASE: ${{ inputs.prerelease }}
+      IN_TIMEZONE: ${{ inputs.timezone }}
+      IN_LOCALE: ${{ inputs.locale }}
+      IN_SSH_PUBKEY: ${{ inputs.ssh_pubkey }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          case "${IN_RELEASE}" in trixie|bookworm) ;; *) echo "::error::release must be trixie or bookworm"; exit 1 ;; esac
+          if [[ ! "${IN_ARMBIAN_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::armbian_ref contains unexpected characters"; exit 1
+          fi
+          if [[ ! "${IN_EXPECTED_KERNEL}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::expected_kernel must look like 6.1.172"; exit 1
+          fi
+          if [[ -n "${IN_TIMEZONE}" && ! "${IN_TIMEZONE}" =~ ^[A-Za-z0-9_+/-]+$ ]]; then
+            echo "::error::timezone must look like Europe/Moscow"; exit 1
+          fi
+          if [[ -n "${IN_LOCALE}" && ! "${IN_LOCALE}" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
+            echo "::error::locale must look like en_US.UTF-8"; exit 1
+          fi
+          if [[ -n "${IN_SSH_PUBKEY}" ]]; then
+            if [[ "${IN_SSH_PUBKEY}" == *$'\n'* ]] || \
+               [[ ! "${IN_SSH_PUBKEY}" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)\ [A-Za-z0-9+/=]+(\ .*)?$ ]]; then
+              echo "::error::ssh_pubkey is not a single OpenSSH public key line"; exit 1
+            fi
+          fi
+          echo "Runner: $(uname -m), $(. /etc/os-release && echo "${PRETTY_NAME}")"
+
+      - name: Free disk space
+        run: |
+          set -uo pipefail
+          echo "Before:"; df -h / /mnt 2>/dev/null || df -h /
+          # Крупные предустановленные SDK, ненужные для сборки Armbian
+          sudo rm -rf \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /usr/local/share/powershell /usr/share/swift \
+            /usr/local/julia* /opt/az /opt/microsoft /opt/google /opt/pipx \
+            /usr/local/share/chromium /usr/lib/jvm /opt/hostedtoolcache || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          echo "After:"; df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Put build directory on the largest disk
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/build"
+          root_free=$(df --output=avail -B1G / | tail -1 | tr -d ' ')
+          mnt_free=0
+          if mountpoint -q /mnt; then
+            mnt_free=$(df --output=avail -B1G /mnt | tail -1 | tr -d ' ')
+          fi
+          echo "Free: / ${root_free}G, /mnt ${mnt_free}G"
+          if (( mnt_free > root_free )); then
+            sudo mkdir -p /mnt/armbian-build
+            sudo chown "$(id -u):$(id -g)" /mnt/armbian-build
+            sudo mount --bind /mnt/armbian-build "${GITHUB_WORKSPACE}/build"
+            echo "build/ is bind-mounted from /mnt"
+          fi
+          df -h "${GITHUB_WORKSPACE}/build"
+
+      - name: Checkout this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: custom
+          persist-credentials: false
+
+      - name: Checkout armbian/build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: armbian/build
+          ref: ${{ inputs.armbian_ref }}
+          path: build
+          fetch-depth: 1
+          clean: false
+          persist-credentials: false
+
+      - name: Pin sources (armbian/build and kernel SHAs)
+        id: pin
+        run: |
+          set -euo pipefail
+          cd build
+          armbian_sha=$(git rev-parse HEAD)
+          armbian_date=$(git log -1 --format=%cI)
+          armbian_subject=$(git log -1 --format=%s)
+          armbian_version=$(cat VERSION 2>/dev/null || echo unknown)
+
+          # Ветка/источник ядра берутся из актуального rk35xx.conf (case vendor), а не захардкожены
+          fam=config/sources/families/rk35xx.conf
+          vendor_block=$(awk '/^[[:space:]]*vendor\)/{f=1} f{print} f&&/;;/{exit}' "${fam}")
+          kernel_source=$(sed -nE "s/.*KERNELSOURCE=['\"]([^'\"]+)['\"].*/\1/p" <<<"${vendor_block}" | head -1)
+          kernel_branch=$(sed -nE "s/.*KERNELBRANCH=['\"]branch:([^'\"]+)['\"].*/\1/p" <<<"${vendor_block}" | head -1)
+          kernel_sha=""
+          if [[ -n "${kernel_source}" && -n "${kernel_branch}" ]]; then
+            kernel_sha=$(git ls-remote "${kernel_source}" "refs/heads/${kernel_branch}" | cut -f1 || true)
+          fi
+          [[ -n "${kernel_sha}" ]] || echo "::warning::Could not resolve kernel branch SHA (source='${kernel_source}' branch='${kernel_branch}')"
+
+          {
+            echo "armbian_sha=${armbian_sha}"
+            echo "armbian_short=${armbian_sha:0:8}"
+            echo "armbian_date=${armbian_date}"
+            echo "armbian_version=${armbian_version}"
+            echo "kernel_source=${kernel_source}"
+            echo "kernel_branch=${kernel_branch}"
+            echo "kernel_sha=${kernel_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "armbian/build ref '${IN_ARMBIAN_REF}' -> ${armbian_sha} (${armbian_date}) ${armbian_subject}"
+          echo "Armbian VERSION: ${armbian_version}"
+          echo "Kernel: ${kernel_source} ${kernel_branch} -> ${kernel_sha:-unknown}"
+          echo "--- board config ---"
+          grep -E '^(BOARDFAMILY|KERNEL_TARGET|BOOT_SCENARIO|IMAGE_PARTITION_TABLE)=' "config/boards/${BOARD}".* || true
+          grep -E 'BOOTSOURCE=|BOOTBRANCH=' "config/boards/${BOARD}".* || true
+          {
+            echo "### Sources"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| armbian/build ref | \`${IN_ARMBIAN_REF}\` |"
+            echo "| armbian/build SHA | [\`${armbian_sha}\`](https://github.com/armbian/build/commit/${armbian_sha}) (${armbian_date}) |"
+            echo "| Armbian VERSION | \`${armbian_version}\` |"
+            echo "| Kernel branch | \`${kernel_source}\` \`${kernel_branch}\` |"
+            echo "| Kernel branch SHA (at build start) | \`${kernel_sha:-unknown}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Prepare userpatches
+        run: |
+          set -euo pipefail
+          mkdir -p build/userpatches
+          cp -a custom/userpatches/. build/userpatches/
+
+          # Пресет первого входа (/root/.not_logged_in_yet). Пароли не задаются.
+          {
+            echo "# Generated by build-r76s workflow. No passwords here on purpose."
+            if [[ -n "${IN_TIMEZONE}" || -n "${IN_LOCALE}" ]]; then
+              echo 'SET_LANG_BASED_ON_LOCATION="n"'
+            fi
+            [[ -n "${IN_TIMEZONE}" ]] && echo "PRESET_TIMEZONE=\"${IN_TIMEZONE}\""
+            [[ -n "${IN_LOCALE}" ]] && echo "PRESET_LOCALE=\"${IN_LOCALE}\""
+            true
+          } > build/userpatches/firstboot.conf
+          echo "--- firstboot.conf ---"; cat build/userpatches/firstboot.conf
+
+          mkdir -p build/userpatches/overlay
+          rm -f build/userpatches/overlay/root_authorized_keys
+          if [[ -n "${IN_SSH_PUBKEY}" ]]; then
+            printf '%s\n' "${IN_SSH_PUBKEY}" > build/userpatches/overlay/root_authorized_keys
+            echo "SSH public key for root will be installed: $(cut -d' ' -f1 <<<"${IN_SSH_PUBKEY}") ..."
+          fi
+          ls -la build/userpatches
+
+      - name: Install host requirements
+        run: |
+          set -euo pipefail
+          cd build
+          sudo ./compile.sh requirements
+          sudo chown -R "$(id -u):$(id -g)" .
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          cd build
+          # Параметры из userpatches/config-r76s.conf; командная строка их переопределяет.
+          ./compile.sh r76s \
+            BOARD="${BOARD}" \
+            BRANCH="${BRANCH}" \
+            RELEASE="${IN_RELEASE}" \
+            BUILD_MINIMAL=yes \
+            BUILD_DESKTOP=no \
+            KERNEL_CONFIGURE=no \
+            COMPRESS_OUTPUTIMAGE=sha,img,xz \
+            SHARE_LOG=no \
+            KERNEL_GIT=shallow
+          df -h .
+
+      - name: Inspect kernel, U-Boot and DTB
+        id: kernel
+        env:
+          ARMBIAN_SHA: ${{ steps.pin.outputs.armbian_sha }}
+          KERNEL_BRANCH: ${{ steps.pin.outputs.kernel_branch }}
+          KERNEL_SOURCE: ${{ steps.pin.outputs.kernel_source }}
+          KERNEL_SHA_START: ${{ steps.pin.outputs.kernel_sha }}
+        run: |
+          set -euo pipefail
+          out=build/output
+          work=$(mktemp -d)
+
+          kdeb=$(find "${out}" -type f -name 'linux-image-vendor-rk35xx_*.deb' | sort | tail -1)
+          if [[ -z "${kdeb}" ]]; then
+            echo "::error::linux-image-vendor-rk35xx*.deb not found in ${out}"
+            find "${out}" -name '*.deb' | sort
+            exit 1
+          fi
+          kdeb_version=$(dpkg-deb -f "${kdeb}" Version)
+          # Списки пишем в файлы: grep|head под pipefail может упасть по SIGPIPE
+          dpkg-deb -c "${kdeb}" > "${work}/kernel.list"
+          kernel_release=$(grep -oE 'boot/vmlinuz-[^ ]+' "${work}/kernel.list" | sed -n '1s#boot/vmlinuz-##p')
+          kernel_version=$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"${kernel_release}" || true)
+          echo "Kernel package: $(basename "${kdeb}") (${kdeb_version})"
+          echo "Kernel release: ${kernel_release} -> ${kernel_version}"
+
+          kernel_note="matches expected ${IN_EXPECTED_KERNEL}"
+          if [[ "${kernel_version}" != "${IN_EXPECTED_KERNEL}" ]]; then
+            kernel_note="DIFFERS from expected ${IN_EXPECTED_KERNEL}"
+            echo "::warning title=Kernel version mismatch::Built kernel ${kernel_version:-unknown} (${kernel_release}) != expected ${IN_EXPECTED_KERNEL}. armbian/build may have bumped the vendor kernel; check before flashing."
+          fi
+
+          # Ветка ядра могла сдвинуться за время сборки
+          kernel_sha_end=""
+          if [[ -n "${KERNEL_SOURCE}" && -n "${KERNEL_BRANCH}" ]]; then
+            kernel_sha_end=$(git ls-remote "${KERNEL_SOURCE}" "refs/heads/${KERNEL_BRANCH}" | cut -f1 || true)
+          fi
+          if [[ -n "${kernel_sha_end}" && "${kernel_sha_end}" != "${KERNEL_SHA_START}" ]]; then
+            echo "::warning::Kernel branch ${KERNEL_BRANCH} moved during the build: ${KERNEL_SHA_START} -> ${kernel_sha_end}"
+          fi
+
+          # U-Boot
+          udeb=$(find "${out}" -type f -name "linux-u-boot-${BOARD}-${BRANCH}_*.deb" | sort | tail -1)
+          uboot_version="unknown"; uboot_deb_version="unknown"; uboot_fdtfile=""
+          if [[ -n "${udeb}" ]]; then
+            uboot_deb_version=$(dpkg-deb -f "${udeb}" Version)
+            mkdir -p "${work}/uboot"; dpkg-deb -x "${udeb}" "${work}/uboot"
+            itb=$(find "${work}/uboot" -name 'u-boot.itb' | head -1)
+            if [[ -n "${itb}" ]]; then
+              strings "${itb}" > "${work}/uboot.strings"
+              uboot_version=$(grep -m1 -oE 'U-Boot 20[0-9]{2}\.[0-9]{2}[^ ]*' "${work}/uboot.strings" || echo unknown)
+              uboot_fdtfile=$(grep -m1 -oE 'fdtfile=[^ ]+' "${work}/uboot.strings" | cut -d= -f2 || true)
+            fi
+          else
+            echo "::warning::U-Boot package linux-u-boot-${BOARD}-${BRANCH}_*.deb not found"
+          fi
+          echo "U-Boot: ${uboot_version} (package ${uboot_deb_version}), fdtfile=${uboot_fdtfile:-n/a}"
+
+          # DTB
+          dtbdeb=$(find "${out}" -type f -name 'linux-dtb-vendor-rk35xx_*.deb' | sort | tail -1)
+          dtbs=""
+          if [[ -n "${dtbdeb}" ]]; then
+            dpkg-deb -c "${dtbdeb}" > "${work}/dtb.list"
+            dtbs=$( (grep -oE 'rockchip/[^ /]*r76s[^ /]*\.dtb' "${work}/dtb.list" || true) | sort -u | paste -sd ' ')
+          fi
+          [[ -n "${dtbs}" ]] || dtbs=$( (grep -oE 'rockchip/[^ /]*r76s[^ /]*\.dtb' "${work}/kernel.list" || true) | sort -u | paste -sd ' ')
+          echo "DTB in kernel packages: ${dtbs:-not found}"
+
+          # Образ
+          img=$(find "${out}/images" -maxdepth 1 -type f -name '*.img.xz' | sort | tail -1)
+          if [[ -z "${img}" ]]; then
+            echo "::error::No .img.xz in ${out}/images"; ls -la "${out}/images" || true; exit 1
+          fi
+          img_name=$(basename "${img}")
+          (cd "$(dirname "${img}")" && sha256sum "${img_name}" > "${img_name}.sha256")
+          img_size=$(du -h "${img}" | cut -f1)
+          echo "Image: ${img_name} (${img_size})"
+
+          {
+            echo "kernel_version=${kernel_version}"
+            echo "kernel_release=${kernel_release}"
+            echo "kernel_deb_version=${kdeb_version}"
+            echo "kernel_sha_end=${kernel_sha_end}"
+            echo "uboot_version=${uboot_version}"
+            echo "uboot_deb_version=${uboot_deb_version}"
+            echo "uboot_fdtfile=${uboot_fdtfile}"
+            echo "dtbs=${dtbs}"
+            echo "image=${img_name}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Result"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Kernel | **${kernel_version:-unknown}** (\`${kernel_release}\`) — ${kernel_note} |"
+            echo "| Kernel package | \`$(basename "${kdeb}")\` |"
+            echo "| Kernel branch SHA (after build) | \`${kernel_sha_end:-unknown}\` |"
+            echo "| U-Boot | \`${uboot_version}\` (package \`${uboot_deb_version}\`) |"
+            echo "| U-Boot fdtfile | \`${uboot_fdtfile:-n/a}\` |"
+            echo "| DTB | \`${dtbs:-not found}\` |"
+            echo "| Image | \`${img_name}\` (${img_size}) |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Compose release metadata
+        id: meta
+        env:
+          ARMBIAN_SHA: ${{ steps.pin.outputs.armbian_sha }}
+          ARMBIAN_SHORT: ${{ steps.pin.outputs.armbian_short }}
+          ARMBIAN_DATE: ${{ steps.pin.outputs.armbian_date }}
+          ARMBIAN_VERSION: ${{ steps.pin.outputs.armbian_version }}
+          KERNEL_SOURCE: ${{ steps.pin.outputs.kernel_source }}
+          KERNEL_BRANCH: ${{ steps.pin.outputs.kernel_branch }}
+          KERNEL_SHA: ${{ steps.pin.outputs.kernel_sha }}
+          KERNEL_SHA_END: ${{ steps.kernel.outputs.kernel_sha_end }}
+          KERNEL_VERSION: ${{ steps.kernel.outputs.kernel_version }}
+          KERNEL_RELEASE: ${{ steps.kernel.outputs.kernel_release }}
+          KERNEL_DEB_VERSION: ${{ steps.kernel.outputs.kernel_deb_version }}
+          UBOOT_VERSION: ${{ steps.kernel.outputs.uboot_version }}
+          UBOOT_DEB_VERSION: ${{ steps.kernel.outputs.uboot_deb_version }}
+          UBOOT_FDTFILE: ${{ steps.kernel.outputs.uboot_fdtfile }}
+          DTBS: ${{ steps.kernel.outputs.dtbs }}
+          IMAGE: ${{ steps.kernel.outputs.image }}
+          RUNNER_LABEL: ${{ inputs.runner }}
+        run: |
+          set -euo pipefail
+          tag="r76s-${IN_RELEASE}-${KERNEL_VERSION:-unknown}-$(date -u +%Y%m%d)-${ARMBIAN_SHORT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          readme="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/README.md"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          mkdir -p dist
+          cat > dist/release-notes.md <<EOF
+          Armbian для **FriendlyElec NanoPi R76S** (RK3576), минимальный CLI, Debian **${IN_RELEASE}**, vendor-ядро **${KERNEL_VERSION:-unknown}**.
+
+          Инструкция по записи и первому запуску: [README](${readme}). Пишите образ на **запасную** SD-карту.
+
+          | | |
+          |---|---|
+          | armbian/build | [\`${ARMBIAN_SHA}\`](https://github.com/armbian/build/commit/${ARMBIAN_SHA}) (${ARMBIAN_DATE}), ref \`${IN_ARMBIAN_REF}\` |
+          | Armbian VERSION | \`${ARMBIAN_VERSION}\` |
+          | Ядро | **${KERNEL_VERSION:-unknown}** (\`${KERNEL_RELEASE}\`), пакет \`${KERNEL_DEB_VERSION}\` |
+          | Ветка ядра | ${KERNEL_SOURCE} \`${KERNEL_BRANCH}\` @ \`${KERNEL_SHA:-unknown}\` (на конец сборки: \`${KERNEL_SHA_END:-unknown}\`) |
+          | U-Boot | \`${UBOOT_VERSION}\` (пакет \`${UBOOT_DEB_VERSION}\`), fdtfile \`${UBOOT_FDTFILE:-n/a}\` |
+          | DTB | \`${DTBS:-n/a}\` |
+          | Параметры | \`BOARD=${BOARD} BRANCH=${BRANCH} RELEASE=${IN_RELEASE} BUILD_MINIMAL=yes BUILD_DESKTOP=no KERNEL_CONFIGURE=no COMPRESS_OUTPUTIMAGE=sha,img,xz KERNEL_GIT=shallow\` |
+          | Пресет первого входа | TZ \`${IN_TIMEZONE:-ask}\`, locale \`${IN_LOCALE:-ask}\`, SSH-ключ root: $([[ -n "${IN_SSH_PUBKEY}" ]] && echo да || echo нет) |
+          | Раннер | \`${RUNNER_LABEL}\` ($(uname -m)) |
+          | Сборка | ${run_url} |
+
+          Проверка: \`sha256sum -c ${IMAGE}.sha256\`
+          EOF
+          cat dist/release-notes.md
+          cp build/output/images/"${IMAGE}" build/output/images/"${IMAGE}".sha256 dist/
+          if [[ -f build/output/images/"${IMAGE}".sha ]]; then
+            cp build/output/images/"${IMAGE}".sha dist/
+          fi
+          ls -la dist
+
+      - name: Upload image artifact (7 days)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: r76s-image
+          path: dist/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: r76s-build-logs
+          path: build/output/logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: r76s-image
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          IN_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          tag="${TAG}"
+          # Повторная сборка того же SHA в тот же день не должна падать на существующем теге
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            tag="${tag}-run${GITHUB_RUN_NUMBER}"
+          fi
+          args=(--repo "${GITHUB_REPOSITORY}" --target "${GITHUB_SHA}"
+                --title "NanoPi R76S Armbian — ${tag}" --notes-file dist/release-notes.md)
+          if [[ "${IN_PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          files=(dist/"${IMAGE}" dist/"${IMAGE}".sha256)
+          [[ -f dist/"${IMAGE}".sha ]] && files+=(dist/"${IMAGE}".sha)
+          gh release create "${tag}" "${args[@]}" "${files[@]}"
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}"
+          echo "Release: ${url}"
+          echo "### Release: [${tag}](${url})" >> "${GITHUB_STEP_SUMMARY}"
